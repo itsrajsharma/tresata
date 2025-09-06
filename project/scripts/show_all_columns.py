@@ -126,7 +126,7 @@ def main():
         print("Failed to load or construct classifier:", e)
         sys.exit(2)
 
-    df = pd.read_csv(input_path)
+    df = pd.read_csv(input_path, header=0)
     results = []
     for col in df.columns:
         vals = df[col].astype(str).fillna("").tolist()

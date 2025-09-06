@@ -19,13 +19,31 @@ class FeatureExtractor:
         self.date_regexes = [
             re.compile(r"^\d{4}-\d{2}-\d{2}$"),                               # YYYY-MM-DD
             re.compile(r"^\d{2}/\d{2}/\d{4}$"),                               # DD/MM/YYYY
-            re.compile(r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s\d{1,2},\s\d{4}$", re.IGNORECASE), # Month DD, YYYY
-            re.compile(r"^\d{1,2}\s(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{4}$", re.IGNORECASE), # DD Mon YYYY
+            re.compile(r"^(?:January|February|March|April|May|June|July|August|September|October|November|December)\s\d{1,2},\s\d{4}$", re.IGNORECASE), # Month DD, YYYY
+            re.compile(r"^\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{4}$", re.IGNORECASE), # DD Mon YYYY
+            re.compile(r"^\d{1,2}(?:st|nd|rd|th)?\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{4}$", re.IGNORECASE), # DDth Mon YYYY
+            re.compile(r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{1,2}(?:st|nd|rd|th)?,\s\d{4}$", re.IGNORECASE), # Mon DDth, YYYY
+            re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$"),                               # DD-MM-YYYY or MM-DD-YYYY
+            re.compile(r"^\d{4}\.\d{2}\.\d{2}$"),                               # YYYY.MM.DD
+            re.compile(r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s\d{1,2}(?:st|nd|rd|th)?\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{4}$", re.IGNORECASE), # Day DD Mon YYYY
+            re.compile(r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{1,2}(?:st|nd|rd|th)?\s\d{4}$", re.IGNORECASE), # Day Mon DD YYYY
+            re.compile(r"^\d{1,2}/\d{1,2}/\d{2}$"), # MM/DD/YY or DD/MM/YY
+            re.compile(r"\b(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?[\s,]*\d{4}\b", re.IGNORECASE) # More flexible date with text
         ]
         self.month_names = set([
             "january", "february", "march", "april", "may", "june",
             "july", "august", "september", "october", "november", "december"
         ])
+        
+        # Pre-process legal suffixes for efficient token-based lookup
+        self.normalized_legal_suffix_token_lists = []
+        for suffix in self.legal_suffixes:
+            # Normalize suffix: remove common punctuation and split into lowercase tokens
+            normalized_tokens = tuple(re.findall(r'\b\w+\b', suffix.lower()))
+            if normalized_tokens:
+                self.normalized_legal_suffix_token_lists.append(normalized_tokens)
+        # Sort by length descending for greedy matching of longer suffixes first
+        self.normalized_legal_suffix_token_lists.sort(key=len, reverse=True)
 
     def _load_countries(self, filepath):
         # This method is no longer needed as countries are loaded globally
@@ -49,20 +67,22 @@ class FeatureExtractor:
         features['contains_dash'] = '-' in value
         features['contains_slash'] = '/' in value
         
-        tokens = re.findall(r'\b\w+\b', value.lower())
+        tokens = re.findall(r'\b\w+\b', value.lower()) # Re-extract tokens after cleaning
         features['avg_token_len'] = sum(len(token) for token in tokens) / len(tokens) if tokens else 0
         features['num_unique_tokens'] = len(set(tokens))
         features['max_token_len'] = max(len(token) for token in tokens) if tokens else 0
         
         # Dictionary checks
-        features['is_country'] = 1 if value.lower() in self.countries_set else 0
-        # Improved legal suffix check: tokenize and match against the end of the cleaned tokens
-        cleaned_value_lower = re.sub(r'[.,!?;:]', '', value.lower())
+        features['is_country'] = 1 if any(token in self.countries_set for token in tokens) else 0 # More flexible country check
+        
+        # Improved legal suffix check: token-based matching
         features['has_legal_suffix'] = 0
-        for suffix in sorted(list(self.legal_suffixes), key=len, reverse=True):
-            if cleaned_value_lower.endswith(suffix) and (len(cleaned_value_lower) == len(suffix) or cleaned_value_lower[-(len(suffix) + 1)] == ' '):
-                features['has_legal_suffix'] = 1
-                break
+        if tokens: # Only proceed if there are tokens to check
+            for suffix_tokens in self.normalized_legal_suffix_token_lists:
+                # Check if the sequence of suffix_tokens appears at the end of the value's tokens
+                if len(tokens) >= len(suffix_tokens) and tokens[len(tokens) - len(suffix_tokens):] == list(suffix_tokens):
+                    features['has_legal_suffix'] = 1
+                    break
 
         # Regex checks
         features['regex_phone_matches_count'] = sum(1 for regex in self.phone_regexes if regex.search(value))
@@ -104,7 +124,8 @@ class Classifier:
         
         # Heuristic-based classification
         phone_score = features_df['regex_phone_matches_count'].mean()
-        date_score = features_df['regex_date_matches_count'].mean() + features_df['contains_month_names'].mean()
+        # Modified date_score calculation to give more weight to pure regex matches
+        date_score = features_df['regex_date_matches_count'].mean() * 0.8 + features_df['contains_month_names'].mean() * 0.2
         country_score = features_df['is_country'].mean()
         company_score = features_df['has_legal_suffix'].mean()
         
@@ -115,16 +136,17 @@ class Classifier:
             "CompanyName": company_score,
         }
         
-        # Simple rule-based cascade
-        if phone_score > 0.8:
-            return "PhoneNumber", phone_score
-        if date_score > 0.7:
-            return "Date", date_score
-        if country_score > 0.9:
-            return "Country", country_score
-        if company_score > 0.7:
-            return "CompanyName", company_score
+        # Find the label with the maximum score
+        best_label = "Other"
+        max_score = 0.0
+        
+        for label, score in scores.items():
+            if score > max_score:
+                max_score = score
+                best_label = label
+        
+        # If all scores are 0, default to "Other" with 0.0 confidence (or initial 0.5)
+        if max_score == 0.0: # If no specific feature was detected at all
+            return "Other", 0.5 # Default confidence when no specific feature matches
             
-        # If no high-confidence heuristic, default to "Other" for now
-        # ML model will be integrated here later for more nuanced classification
-        return "Other", 0.5 
+        return best_label, max_score 
