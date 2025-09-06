@@ -1,0 +1,4 @@
+pandas
+phonenumbers
+scikit-learn
+pytest 
